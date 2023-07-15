@@ -6,14 +6,10 @@
 // ==LICENSE-END==
 
 import * as debug_ from "debug";
-import * as request from "request";
-import * as requestPromise from "request-promise-native";
+
 import { PassThrough } from "stream";
 import * as yauzl from "yauzl";
-
-import { bufferToStream, streamToBufferPromise } from "../stream/BufferUtils";
-
-// import { HttpReadableStream } from "./HttpReadableStream";
+import { bufferToStream } from "../stream/BufferUtils";
 
 const debug = debug_("r2:utils#zip/zip2RandomAccessReader_Http");
 
@@ -30,8 +26,9 @@ const debug = debug_("r2:utils#zip/zip2RandomAccessReader_Http");
 //     close(callback: (err?: Error) => void): void;
 // }
 
-export class HttpZipReader extends yauzl.RandomAccessReader {
+const MAX_FIRST_BUFFER_SIZE = 200 * 1024; // 200K
 
+export class HttpZipReader extends yauzl.RandomAccessReader {
     private firstBuffer: Buffer | undefined = undefined;
     private firstBufferStart = 0;
     private firstBufferEnd = 0;
@@ -42,131 +39,80 @@ export class HttpZipReader extends yauzl.RandomAccessReader {
     }
 
     public _readStreamForRange(start: number, end: number) {
-        // const length = end - start;
-        // debug(`_readStreamForRange (new HttpReadableStream) ${this.url}` +
-        //     ` content-length=${this.byteLength} start=${start} end+1=${end} (length=${length})`);
-
-        // return new HttpReadableStream(this.url, this.byteLength, start, end);
-        // =>
-
-        // const length = end - start;
-        // debug(`_read: ${size} (${this.url}` +
-        //     ` content-length=${this.byteLength} start=${this.start} end+1=${this.end} (length=${length}))`);
-        // debug(`alreadyRead: ${this.alreadyRead} (byteLength: ${length})`);
+        const stream = new PassThrough();
 
         if (this.firstBuffer && start >= this.firstBufferStart && end <= this.firstBufferEnd) {
-
-            // debug(`HTTP CACHE ${this.url}: ${start}-${end} (${length}) [${this.byteLength}]`);
-
             const begin = start - this.firstBufferStart;
             const stop = end - this.firstBufferStart;
-
             return bufferToStream(this.firstBuffer.slice(begin, stop));
         }
 
-        const stream = new PassThrough();
+        const length = end - start;
 
         const lastByteIndex = end - 1;
         const range = `${start}-${lastByteIndex}`;
 
-        // debug(`HTTP GET ${this.url}: ${start}-${end} (${length}) [${this.byteLength}]`);
-
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const failure = (err: any) => {
-            debug(err);
-            // this.stream.end();
+        const failure = (err: unknown) => {
+            debug(err as string);
+            stream.end();
         };
 
-        const success = async (res: request.RequestResponse) => {
-            if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
-                failure("HTTP CODE " + res.statusCode);
+        const success = async (response: Response) => {
+            if (!response.ok) {
+                failure("HTTP CODE " + response.status);
                 return;
             }
 
-            // debug(res);
-
-            // debug(res.headers);
-            // debug(res.headers["content-type"]);
-            // debug(`HTTP response content-range: ${res.headers["content-range"]}`);
-            // debug(`HTTP response content-length: ${res.headers["content-length"]}`);
-
-            if (this.firstBuffer) {
-                res.pipe(stream);
-                // // .on("end", () => {
-                // //     debug("END");
-                // // });
-            } else {
-                let buffer: Buffer;
-                try {
-                    buffer = await streamToBufferPromise(res);
-                } catch (err) {
-                    debug(err);
-                    stream.end();
-                    return;
-                }
-                debug(`streamToBufferPromise: ${buffer.length}`);
-
-                this.firstBuffer = buffer;
-                this.firstBufferStart = start;
-                this.firstBufferEnd = end;
-
-                stream.write(buffer);
-                stream.end();
+            if (!(response.body instanceof ReadableStream)) {
+                failure("Body is not readable");
+                return;
             }
+
+            if (length > MAX_FIRST_BUFFER_SIZE) {
+                // Do not put in memory buffer
+                const reader = (response.body).getReader();
+                let readResult = await reader.read();
+
+                while (!readResult.done) {
+                    const buffer = Buffer.from(readResult.value);
+                    stream.write(buffer);
+                    readResult = await reader.read();
+                }
+            } else {
+                const arrayBuffer = await response.arrayBuffer();
+                const buffer = Buffer.from(arrayBuffer);
+
+                if (this.firstBuffer == null) {
+                    this.firstBuffer = buffer;
+                    this.firstBufferStart = start;
+                    this.firstBufferEnd = end;
+                }
+                stream.write(buffer);
+            }
+
+            stream.end();
         };
 
-        // No response streaming! :(
-        // https://github.com/request/request-promise/issues/90
-        const needsStreamingResponse = true;
-        if (needsStreamingResponse) {
-            request.get({
-                headers: { Range: `bytes=${range}` },
-                method: "GET",
-                uri: this.url,
-            })
-                .on("response", async (res) => {
-                    try {
-                        await success(res);
-                    }
-                    catch (successError) {
-                        failure(successError);
-                        return;
-                    }
-                })
-                .on("error", failure);
-        } else {
-            // tslint:disable-next-line:no-floating-promises
-            (async () => {
-                let res: requestPromise.FullResponse;
+        debug(`_readStreamForRange (new HttpReadableStream) ${this.url}` +
+        ` content-length=${this.byteLength} start=${start} end+1=${end} (length=${length})`);
+
+        fetch(this.url, {
+            headers: { Range: `bytes=${range}` },
+            method: "GET",
+        }).then(async (response) => {
                 try {
-                    // tslint:disable-next-line:await-promise no-floating-promises
-                    res = await requestPromise({
-                        headers: { Range: `bytes=${range}` },
-                        method: "GET",
-                        resolveWithFullResponse: true,
-                        uri: this.url,
-                    });
-                } catch (err) {
-                    failure(err);
+                    await success(response);
+                }
+                catch (successError) {
+                    failure(successError);
                     return;
                 }
+            })
+            .catch((error) => {
+                failure(error);
+            });
 
-                await success(res);
-            })()
-                // .then(() => {
-                //     debug("done");
-                // }).catch((err) => {
-                //     debug(err);
-                // })
-                ;
-        }
 
         return stream;
     }
 }
-// util.inherits(HttpZipReader, yauzl.RandomAccessReader);
-
-// // tslint:disable-next-line:space-before-function-paren
-// HttpZipReader.prototype._readStreamForRange = function (start: number, end: number) {
-
-// };
